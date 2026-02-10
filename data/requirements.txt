@@ -1,0 +1,26 @@
+# DJ Mix Data Pipeline Requirements
+
+# Scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.0
+pydub>=0.25.0
+demucs>=4.0.0
+
+# Analysis
+madmom>=0.17.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Optional: essentia (may require separate install)
+# pip install essentia-tensorflow
+
+# Utilities
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+
+# yt-dlp should be installed system-wide

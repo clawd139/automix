@@ -1,0 +1,101 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "automix"
+version = "2.0.0"
+description = "Neural DJ transition generation using conditional diffusion models"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Clawd", email = "clawd139@icloud.com"}
+]
+keywords = ["dj", "music", "audio", "machine-learning", "diffusion", "pytorch"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "numpy>=1.24.0",
+    "einops>=0.6.0",
+    "tqdm>=4.65.0",
+    "click>=8.0.0",
+    "librosa>=0.10.0",
+    "demucs>=4.0.0",
+    "soundfile>=0.12.0",
+]
+
+[project.optional-dependencies]
+training = [
+    "wandb>=0.15.0",
+    "tensorboard>=2.13.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.7.0",
+    "isort>=5.12.0",
+    "mypy>=1.4.0",
+]
+all = [
+    "automix[training,dev]",
+]
+
+[project.scripts]
+automix = "automix.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/clawd139/automix"
+Documentation = "https://github.com/clawd139/automix#readme"
+Repository = "https://github.com/clawd139/automix"
+Issues = "https://github.com/clawd139/automix/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["automix"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+    | \.venv
+    | venv
+    | \.uv
+    | build
+    | dist
+    | __pycache__
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = [".git", "venv", ".uv", "__pycache__"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = ["venv", ".uv", "build", "dist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=automix --cov-report=term-missing"
