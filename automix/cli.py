@@ -249,6 +249,81 @@ def mix(track_a: str, track_b: str, output: str, model: Optional[str],
     click.echo(f"✅ Transition saved to {result['output']}")
 
 
+@main.command("pull-model")
+@click.option("--run", "-r", type=str, default=None,
+              help="Run name (subdirectory in checkpoints/). Default: latest")
+@click.option("--gcs-bucket", type=str, default="gs://clawd139/automix-data",
+              help="GCS bucket to download from")
+@click.option("--output", "-o", type=click.Path(), default="models/",
+              help="Local directory to save model")
+@click.option("--best-only", is_flag=True, default=True,
+              help="Only download best_model.pt (default: True)")
+def pull_model(run: Optional[str], gcs_bucket: str, output: str, best_only: bool):
+    """Download a trained model from GCS.
+    
+    After training on a cluster, pull the model to your local machine for inference.
+    
+    Examples:
+        # Download latest best model
+        automix pull-model
+        
+        # Download a specific run
+        automix pull-model --run h100-run1
+        
+        # Then use it
+        automix mix track_a.mp3 track_b.mp3 --model models/best_model.pt
+    """
+    import subprocess
+    
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    checkpoints_prefix = f"{gcs_bucket}/checkpoints/"
+    
+    if run is None:
+        # List available runs and pick the latest
+        click.echo(f"🔍 Listing runs in {checkpoints_prefix}...")
+        result = subprocess.run(
+            ["gsutil", "ls", checkpoints_prefix],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            click.echo(f"❌ Failed to list GCS: {result.stderr.strip()}")
+            return
+        
+        runs = [line.strip().rstrip("/").split("/")[-1] for line in result.stdout.strip().split("\n") if line.strip()]
+        if not runs:
+            click.echo("❌ No runs found in GCS")
+            return
+        
+        run = runs[-1]  # Latest
+        click.echo(f"📦 Latest run: {run}")
+    
+    gcs_run_path = f"{checkpoints_prefix}{run}/"
+    
+    if best_only:
+        src = f"{gcs_run_path}best_model.pt"
+        dst = str(output_path / "best_model.pt")
+        click.echo(f"⬇️  Downloading {src} → {dst}")
+        result = subprocess.run(["gsutil", "cp", src, dst], capture_output=True, text=True)
+        if result.returncode != 0:
+            click.echo(f"❌ Download failed: {result.stderr.strip()}")
+            return
+    else:
+        click.echo(f"⬇️  Downloading all checkpoints from {gcs_run_path}...")
+        result = subprocess.run(
+            ["gsutil", "-m", "rsync", "-r", gcs_run_path, str(output_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            click.echo(f"❌ Download failed: {result.stderr.strip()}")
+            return
+    
+    click.echo(f"✅ Model downloaded to {output_path}/")
+    click.echo(f"\nTo use it:")
+    click.echo(f"  automix mix track_a.mp3 track_b.mp3 --model {output_path}/best_model.pt -o transition.wav")
+
+
 @main.command()
 def info():
     """Show system information and capabilities."""

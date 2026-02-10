@@ -44,7 +44,8 @@ except ImportError:
 # Configuration
 DATA_DIR = Path(__file__).parent
 TRANSITIONS_DIR = DATA_DIR / "transitions"
-TRACKS_DIR = DATA_DIR / "tracks"
+TRACKS_DIR = DATA_DIR / "raw" / "tracks"
+MIXES_DIR = DATA_DIR / "raw" / "mixes"
 ANALYSIS_DIR = DATA_DIR / "analysis"
 
 

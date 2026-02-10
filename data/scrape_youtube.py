@@ -19,9 +19,9 @@ from tqdm import tqdm
 
 # Configuration
 DATA_DIR = Path(__file__).parent
-MIXES_DIR = DATA_DIR / "mixes"
+MIXES_DIR = DATA_DIR / "raw" / "mixes"
 METADATA_DIR = DATA_DIR / "metadata" / "youtube"
-RATE_LIMIT = 3  # Seconds between requests
+RATE_LIMIT = 2  # Seconds between requests
 
 
 def log(message: str):

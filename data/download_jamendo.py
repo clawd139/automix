@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 # Configuration
 DATA_DIR = Path(__file__).parent
-TRACKS_DIR = DATA_DIR / "tracks"
+TRACKS_DIR = DATA_DIR / "raw" / "tracks"
 OLD_DATA_DIR = Path(__file__).parent.parent.parent / "djtransgan" / "data"
 TSV_PATH = OLD_DATA_DIR / "edm_tracks.tsv"
 

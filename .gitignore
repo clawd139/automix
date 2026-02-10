@@ -48,12 +48,21 @@ htmlcov/
 .mypy_cache/
 
 # Data and outputs
+data/raw/
+data/processed*/
+data/analysis/
+data/metadata/
+data/manifest.json
 processed/
 outputs/
 runs/
+models/
 checkpoints/
 *.wav
 *.mp3
+*.m4a
+*.webm
+*.opus
 *.flac
 *.pt
 *.pth

@@ -234,6 +234,7 @@ class DJTransitionTrainer:
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.gcs_checkpoint_bucket = gcs_bucket
         
         # DDP setup
         self.is_distributed = False
@@ -498,8 +499,21 @@ class DJTransitionTrainer:
             'loss': loss.item(),
         }
     
+    def _upload_to_gcs(self, local_path: str, gcs_path: str):
+        """Upload a file to GCS in the background."""
+        import subprocess
+        try:
+            subprocess.Popen(
+                ["gsutil", "-q", "cp", str(local_path), gcs_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info(f"Uploading {local_path} → {gcs_path}")
+        except FileNotFoundError:
+            logger.warning("gsutil not found, skipping GCS upload")
+
     def save_checkpoint(self, path: Optional[str] = None, is_best: bool = False):
-        """Save checkpoint (only on rank 0 for DDP)."""
+        """Save checkpoint (only on rank 0 for DDP). Auto-uploads to GCS if configured."""
         # Only rank 0 saves
         if self.is_distributed and self.rank != 0:
             return
@@ -523,10 +537,19 @@ class DJTransitionTrainer:
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
         
+        # Auto-upload to GCS
+        if self.gcs_checkpoint_bucket:
+            run_name = self.output_dir.name
+            self._upload_to_gcs(str(path), f"{self.gcs_checkpoint_bucket}/checkpoints/{run_name}/{Path(path).name}")
+        
         if is_best:
             best_path = self.output_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
             logger.info(f"Saved best model to {best_path}")
+            
+            if self.gcs_checkpoint_bucket:
+                run_name = self.output_dir.name
+                self._upload_to_gcs(str(best_path), f"{self.gcs_checkpoint_bucket}/checkpoints/{run_name}/best_model.pt")
     
     def load_checkpoint(self, path: str):
         """Load checkpoint."""
