@@ -90,6 +90,35 @@ def load_audio_file(path: Path, target_sr: int = 44100) -> tuple:
     return waveform, target_sr
 
 
+def save_audio_file(path: Path, waveform: torch.Tensor, sample_rate: int):
+    """
+    Save audio file using soundfile (more reliable than torchaudio for newer versions).
+    
+    Args:
+        path: Output path (should be .wav)
+        waveform: [channels, samples] tensor
+        sample_rate: Sample rate
+    """
+    path = Path(path)
+    
+    # Ensure wav extension
+    if path.suffix.lower() != '.wav':
+        path = path.with_suffix('.wav')
+    
+    # Convert to numpy for soundfile
+    audio_np = waveform.numpy()
+    
+    # soundfile expects [samples, channels]
+    if audio_np.ndim == 2:
+        audio_np = audio_np.T
+    
+    if sf is not None:
+        sf.write(str(path), audio_np, sample_rate)
+    else:
+        # Fallback to torchaudio
+        torchaudio.save(str(path), waveform, sample_rate)
+
+
 # Configuration
 DEFAULT_OUTPUT_DIR = Path("./processed")
 DEFAULT_SAMPLE_RATE = 44100
@@ -144,23 +173,26 @@ def run_demucs(
     ]
     
     try:
+        # Run demucs - don't capture stderr as it contains progress bars
         result = subprocess.run(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
             text=True,
             timeout=1800,  # 30 min timeout
         )
         
-        if result.returncode != 0:
-            log(f"Demucs error: {result.stderr[:500]}")
-            return None
-        
-        # Find output directory
+        # Find output directory - check if it was created successfully
         stem_name = audio_path.stem
         stems_dir = output_dir / model / stem_name
         
-        if stems_dir.exists():
+        if stems_dir.exists() and any(stems_dir.glob("*.wav")):
             return stems_dir
+        
+        # If directory doesn't exist but return code is 0, something went wrong
+        if result.returncode != 0:
+            log(f"Demucs error (code {result.returncode})")
+            return None
         
         log(f"Stems directory not found: {stems_dir}")
         return None
@@ -286,16 +318,14 @@ def extract_audio_segment(
     sample_rate: int = DEFAULT_SAMPLE_RATE,
 ):
     """Extract a segment from audio file."""
-    waveform, sr = torchaudio.load(str(audio_path))
-    if sr != sample_rate:
-        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
+    waveform, _ = load_audio_file(audio_path, sample_rate)
     
     start_sample = int(start_sec * sample_rate)
     end_sample = int(end_sec * sample_rate)
     
     segment = waveform[:, start_sample:end_sample]
     
-    torchaudio.save(str(output_path), segment, sample_rate)
+    save_audio_file(output_path, segment, sample_rate)
 
 
 def process_transition_pair(
@@ -358,12 +388,12 @@ def process_transition_pair(
         
         # Copy transition audio
         trans_output = pair_dir / "transition.wav"
-        if transition_audio.suffix == ".wav":
+        if transition_audio.suffix.lower() == ".wav":
             shutil.copy(transition_audio, trans_output)
         else:
             # Convert to wav
-            waveform, sr = torchaudio.load(str(transition_audio))
-            torchaudio.save(str(trans_output), waveform, sr)
+            waveform, sr = load_audio_file(transition_audio, DEFAULT_SAMPLE_RATE)
+            save_audio_file(trans_output, waveform, sr)
         
         # Analyze all audio
         log(f"  Analyzing audio...", log_file)
@@ -550,9 +580,9 @@ def process_track_library(
             temp_b = temp_dir / f"{pair_id}_b.wav"
             temp_trans = temp_dir / f"{pair_id}_trans.wav"
             
-            torchaudio.save(str(temp_a), seg_a, DEFAULT_SAMPLE_RATE)
-            torchaudio.save(str(temp_b), seg_b, DEFAULT_SAMPLE_RATE)
-            torchaudio.save(str(temp_trans), transition, DEFAULT_SAMPLE_RATE)
+            save_audio_file(temp_a, seg_a, DEFAULT_SAMPLE_RATE)
+            save_audio_file(temp_b, seg_b, DEFAULT_SAMPLE_RATE)
+            save_audio_file(temp_trans, transition, DEFAULT_SAMPLE_RATE)
             
             # Process the pair
             success = process_transition_pair(

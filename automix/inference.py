@@ -76,7 +76,7 @@ def run_demucs(
         sys.executable, "-m", "demucs",
         "-n", model,
         "-o", str(output_dir),
-        "-d", device if device != "mps" else "cpu",  # demucs doesn't support MPS directly
+        "-d", device,  # MPS works with torchcodec installed
         str(audio_path),
     ]
     
