@@ -88,7 +88,7 @@ def prepare(tracks: str, output: str, max_pairs: Optional[int], demucs_model: st
 
 
 @main.command()
-@click.option("--data", "-d", type=click.Path(exists=True), required=True,
+@click.option("--data", "-d", type=click.Path(), required=True,
               help="Path to processed data directory")
 @click.option("--output", "-o", type=click.Path(), default="runs/run1",
               help="Output directory for checkpoints and logs")
@@ -104,9 +104,11 @@ def prepare(tracks: str, output: str, max_pairs: Optional[int], demucs_model: st
               help="Number of GPUs to use (auto-detected if not specified)")
 @click.option("--wandb", is_flag=True, help="Enable Weights & Biases logging")
 @click.option("--synthetic", is_flag=True, help="Use synthetic transition dataset")
+@click.option("--gcs-bucket", type=str, default=None,
+              help="GCS bucket path to download data from if not local (e.g., gs://clawd139/automix-data/processed)")
 def train(data: str, output: str, steps: int, batch_size: Optional[int],
           lr: Optional[float], resume: Optional[str], gpus: Optional[int],
-          wandb: bool, synthetic: bool):
+          wandb: bool, synthetic: bool, gcs_bucket: Optional[str]):
     """Train the transition model.
     
     Auto-detects device and launches multi-GPU training with DDP if available.
@@ -157,6 +159,8 @@ def train(data: str, output: str, steps: int, batch_size: Optional[int],
             cmd.append("--wandb")
         if synthetic:
             cmd.append("--synthetic")
+        if gcs_bucket:
+            cmd.extend(["--gcs-bucket", gcs_bucket])
         
         subprocess.run(cmd)
     else:
@@ -177,6 +181,7 @@ def train(data: str, output: str, steps: int, batch_size: Optional[int],
             resume_from=resume,
             use_wandb=wandb,
             synthetic_data=synthetic,
+            gcs_bucket=gcs_bucket,
         )
     
     click.echo("✅ Training complete!")

@@ -21,9 +21,9 @@ class AudioConfig:
     # Stem names from demucs
     stems: List[str] = field(default_factory=lambda: ["drums", "bass", "vocals", "other"])
     
-    # Structure labels from allin1
+    # Structure labels (must match dataset.py STRUCTURE_LABELS)
     structure_labels: List[str] = field(default_factory=lambda: [
-        "intro", "verse", "chorus", "drop", "bridge", "outro"
+        "intro", "verse", "chorus", "drop", "bridge", "outro", "breakdown", "body"
     ])
     
     # Musical keys (12 major + 12 minor)

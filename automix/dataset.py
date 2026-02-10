@@ -4,10 +4,15 @@ DJTransGAN v2 Dataset
 
 PyTorch Dataset class for DJ transition training data.
 Loads pre-processed track pairs (stems + analysis) and real DJ transitions.
+
+Supports automatic download from Google Cloud Storage if local data is missing.
 """
 
 import json
+import logging
+import os
 import random
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -27,8 +32,100 @@ try:
 except ImportError:
     librosa = None
 
+try:
+    import gcsfs
+    HAS_GCSFS = True
+except ImportError:
+    HAS_GCSFS = False
+
 from .model.config import Config, AudioConfig
 from .model.conditioning import TrackFeatures
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_gcs_data(
+    local_dir: Union[str, Path],
+    gcs_path: str,
+    use_gsutil: bool = True,
+) -> bool:
+    """
+    Ensure data exists locally, downloading from GCS if needed.
+    
+    Args:
+        local_dir: Local directory path for data
+        gcs_path: GCS path (gs://bucket/path)
+        use_gsutil: Use gsutil CLI instead of gcsfs (faster for large dirs)
+        
+    Returns:
+        True if data is available, False otherwise
+    """
+    local_dir = Path(local_dir)
+    
+    # Check if local data already exists and has content
+    if local_dir.exists():
+        # Check if it has actual data (at least one subdirectory with analysis.json)
+        subdirs = list(local_dir.iterdir()) if local_dir.is_dir() else []
+        has_data = any(
+            (d / "analysis.json").exists() 
+            for d in subdirs 
+            if d.is_dir() and not d.name.startswith('_')
+        )
+        if has_data:
+            logger.info(f"Local data found at {local_dir}, skipping download")
+            return True
+    
+    logger.info(f"Local data not found at {local_dir}, downloading from {gcs_path}")
+    
+    # Create local directory
+    local_dir.mkdir(parents=True, exist_ok=True)
+    
+    if use_gsutil:
+        # Use gsutil for faster parallel downloads
+        try:
+            cmd = ["gsutil", "-m", "rsync", "-r", gcs_path.rstrip('/') + '/', str(local_dir) + '/']
+            logger.info(f"Running: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            if result.returncode != 0:
+                logger.error(f"gsutil failed: {result.stderr}")
+                return False
+            logger.info(f"Successfully downloaded data from {gcs_path}")
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error("gsutil download timed out after 1 hour")
+            return False
+        except FileNotFoundError:
+            logger.warning("gsutil not found, falling back to gcsfs")
+    
+    # Fallback to gcsfs
+    if not HAS_GCSFS:
+        logger.error("Neither gsutil nor gcsfs available for GCS download")
+        return False
+    
+    try:
+        fs = gcsfs.GCSFileSystem()
+        
+        # Parse GCS path
+        if gcs_path.startswith("gs://"):
+            gcs_path = gcs_path[5:]
+        
+        # List and download all files
+        files = fs.glob(f"{gcs_path}/**/*")
+        for remote_file in files:
+            if fs.isfile(remote_file):
+                rel_path = remote_file.replace(gcs_path.rstrip('/') + '/', '')
+                local_file = local_dir / rel_path
+                local_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                logger.debug(f"Downloading {remote_file} -> {local_file}")
+                fs.get(remote_file, str(local_file))
+        
+        logger.info(f"Successfully downloaded data from gs://{gcs_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to download from GCS: {e}")
+        return False
 
 
 # Constants
@@ -205,6 +302,9 @@ class DJTransitionDataset(Dataset):
         "transition_duration": float,
         ...
     }
+    
+    Supports automatic download from GCS if local data is missing.
+    Set gcs_bucket to enable (e.g., "gs://clawd139/automix-data/processed")
     """
     
     def __init__(
@@ -214,15 +314,22 @@ class DJTransitionDataset(Dataset):
         n_frames: int = 128,
         augment: bool = True,
         max_samples: Optional[int] = None,
+        gcs_bucket: Optional[str] = None,
     ):
         self.data_dir = Path(data_dir)
         self.config = config or Config()
         self.n_frames = n_frames
         self.augment = augment
+        self.gcs_bucket = gcs_bucket
         
         self.sample_rate = self.config.audio.sample_rate
         self.hop_length = self.config.audio.hop_length
         self.n_mels = self.config.audio.n_mels
+        
+        # Download from GCS if needed
+        if gcs_bucket:
+            if not ensure_gcs_data(self.data_dir, gcs_bucket):
+                logger.warning(f"Failed to download data from {gcs_bucket}")
         
         # Find all valid samples
         self.samples = self._scan_samples()

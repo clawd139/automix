@@ -579,7 +579,9 @@ def create_model(config: Optional[Config] = None) -> DJTransitionModel:
 
 def load_model(path: str, device: str = "cpu") -> DJTransitionModel:
     """Load a trained model from checkpoint."""
-    checkpoint = torch.load(path, map_location=device)
+    # Use weights_only=False for checkpoints that include config objects
+    # This is safe as we trust our own checkpoints
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = checkpoint.get('config', Config())
     model = create_model(config)
     model.load_state_dict(checkpoint['model_state_dict'])

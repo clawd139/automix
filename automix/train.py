@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -35,7 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from .model import (
@@ -228,20 +229,37 @@ class DJTransitionTrainer:
         use_wandb: bool = False,
         use_tensorboard: bool = True,
         synthetic_data: bool = False,
+        gcs_bucket: Optional[str] = None,
     ):
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        # DDP setup
+        self.is_distributed = False
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+        
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.is_distributed = True
+            self.rank = torch.distributed.get_rank()
+            self.world_size = torch.distributed.get_world_size()
+            self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        
         # Device
         if torch.cuda.is_available():
-            self.device = "cuda"
+            if self.is_distributed:
+                self.device = f"cuda:{self.local_rank}"
+                torch.cuda.set_device(self.local_rank)
+            else:
+                self.device = "cuda"
         elif torch.backends.mps.is_available():
             self.device = "mps"
         else:
             self.device = "cpu"
         
-        logger.info(f"Using device: {self.device}")
+        logger.info(f"Using device: {self.device} (rank {self.rank}/{self.world_size})")
         
         # Verify parameter counts match
         assert config.effects.n_params == N_TOTAL_PARAMS, \
@@ -251,7 +269,18 @@ class DJTransitionTrainer:
         self.model = create_model(config)
         self.model.to(self.device)
         
-        n_params = sum(p.numel() for p in self.model.parameters())
+        # Wrap in DDP if distributed
+        if self.is_distributed:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+            )
+            logger.info(f"Wrapped model in DistributedDataParallel")
+        
+        # Get unwrapped model for parameter count
+        model_for_params = self.model.module if self.is_distributed else self.model
+        n_params = sum(p.numel() for p in model_for_params.parameters())
         logger.info(f"Model parameters: {n_params:,}")
         
         # Create mixer
@@ -276,16 +305,36 @@ class DJTransitionTrainer:
                 data_dir=data_dir,
                 config=config,
                 n_frames=config.model.n_frames,
+                gcs_bucket=gcs_bucket,
             )
+        
+        # Set workers=0 on MPS/macOS to avoid shared memory issues
+        # pin_memory only works on CUDA
+        num_workers = 0 if self.device in ("mps", "cpu") else 4
+        pin_memory = self.device.startswith("cuda")
+        
+        # Use DistributedSampler for DDP
+        sampler = None
+        shuffle = True
+        if self.is_distributed:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+            )
+            shuffle = False  # sampler handles shuffling
         
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=config.training.batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
+            shuffle=shuffle,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
             collate_fn=collate_transitions,
         )
+        self.train_sampler = sampler
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -360,47 +409,67 @@ class DJTransitionTrainer:
         }
     
     def train_step(self, batch: Dict) -> Dict[str, float]:
-        """Single training step."""
+        """Single training step using standard diffusion training.
+        
+        Uses the model's forward() method which computes diffusion loss directly.
+        This trains the model to denoise parameter curves.
+        """
         self.model.train()
         batch = self.move_to_device(batch)
         
-        # Convert stems tensor to dict format for mixer
-        def stems_tensor_to_dict(stems_tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
-            # stems_tensor: [batch, n_stems, samples]
-            return {
-                name: stems_tensor[:, i]
-                for i, name in enumerate(STEM_NAMES)
-            }
-        
-        stems_a = stems_tensor_to_dict(batch['track_a_stems'])
-        stems_b = stems_tensor_to_dict(batch['track_b_stems'])
-        target_audio = batch['transition_audio']
-        
-        with autocast(enabled=self.use_amp):
-            # Generate effect parameters from model
-            params = self.model.generate(
+        # AMP only supported on CUDA, skip on MPS/CPU
+        amp_context = autocast(device_type="cuda", enabled=self.use_amp) if self.device == "cuda" else nullcontext()
+        with amp_context:
+            # Create synthetic target parameters from the transition
+            # For now, use a simple linear crossfade as target
+            # In production, these would be extracted from real DJ transitions
+            batch_size = batch['track_a_features'].stem_mels.shape[0]
+            n_frames = self.config.model.n_frames
+            
+            # Generate synthetic target: linear crossfade
+            t = torch.linspace(0, 1, n_frames, device=self.device)
+            fade_out = torch.cos(t * torch.pi / 2)  # A fades out
+            fade_in = torch.sin(t * torch.pi / 2)   # B fades in
+            
+            # Build target params tensor [batch, n_frames, n_params]
+            target_params = torch.zeros(batch_size, n_frames, N_TOTAL_PARAMS, device=self.device)
+            
+            # Track A: stems fade out (gains at indices 0, 6, 12, 18)
+            for stem_idx in range(4):
+                gain_idx = stem_idx * 6
+                target_params[:, :, gain_idx] = fade_out.unsqueeze(0)
+                # EQ at unity
+                target_params[:, :, gain_idx + 1] = 1.0  # eq_low
+                target_params[:, :, gain_idx + 2] = 1.0  # eq_mid
+                target_params[:, :, gain_idx + 3] = 1.0  # eq_high
+                target_params[:, :, gain_idx + 4] = 1.0  # lpf (open)
+                target_params[:, :, gain_idx + 5] = 0.0  # hpf (open)
+            
+            # Track B: stems fade in (gains at indices 27, 33, 39, 45)
+            track_b_offset = 27
+            for stem_idx in range(4):
+                gain_idx = track_b_offset + stem_idx * 6
+                target_params[:, :, gain_idx] = fade_in.unsqueeze(0)
+                # EQ at unity
+                target_params[:, :, gain_idx + 1] = 1.0
+                target_params[:, :, gain_idx + 2] = 1.0
+                target_params[:, :, gain_idx + 3] = 1.0
+                target_params[:, :, gain_idx + 4] = 1.0
+                target_params[:, :, gain_idx + 5] = 0.0
+            
+            # Convert to logit space for diffusion (model outputs in [-inf, inf] then sigmoid)
+            target_params_clamped = target_params.clamp(1e-4, 1 - 1e-4)
+            target_params_logit = torch.logit(target_params_clamped)
+            
+            # Forward pass through diffusion model
+            model_output = self.model(
                 batch['track_a_features'],
                 batch['track_b_features'],
-                n_frames=self.config.model.n_frames,
-                guidance_scale=1.0,  # No guidance during training
-                n_steps=25,  # Faster sampling for training
+                target_params_logit,
+                drop_condition_prob=self.config.training.condition_dropout,
             )
             
-            # Scale params from [0,1] to proper ranges
-            # Most params are 0-1, EQ params are 0-2
-            # The mixer handles this internally based on param index
-            
-            # Apply mixer to generate audio
-            mixed_audio, _ = self.mixer(stems_a, stems_b, params)
-            
-            # Compute losses
-            audio_losses = self.audio_loss(mixed_audio, target_audio)
-            smooth_loss = self.smoothness_loss(params)
-            
-            loss = (
-                audio_losses['total'] +
-                self.config.training.smoothness_loss_weight * smooth_loss
-            )
+            loss = model_output['loss']
         
         # Backward pass
         self.optimizer.zero_grad()
@@ -427,20 +496,23 @@ class DJTransitionTrainer:
         
         return {
             'loss': loss.item(),
-            'audio_loss': audio_losses['total'].item(),
-            'waveform_mse': audio_losses['waveform_mse'].item(),
-            'spectral': audio_losses['spectral'].item(),
-            'smoothness': smooth_loss.item(),
         }
     
     def save_checkpoint(self, path: Optional[str] = None, is_best: bool = False):
-        """Save checkpoint."""
+        """Save checkpoint (only on rank 0 for DDP)."""
+        # Only rank 0 saves
+        if self.is_distributed and self.rank != 0:
+            return
+            
         if path is None:
             path = self.output_dir / f"checkpoint_{self.global_step}.pt"
         
+        # Get model state dict (unwrap DDP if needed)
+        model_to_save = self.model.module if self.is_distributed else self.model
+        
         checkpoint = {
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'ema_state_dict': self.ema.state_dict(),
@@ -458,9 +530,12 @@ class DJTransitionTrainer:
     
     def load_checkpoint(self, path: str):
         """Load checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Load model state dict (handle DDP wrapper)
+        model_to_load = self.model.module if self.is_distributed else self.model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+        
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.ema.load_state_dict(checkpoint['ema_state_dict'])
@@ -485,12 +560,17 @@ class DJTransitionTrainer:
         
         running_loss = 0
         log_count = 0
+        epoch = 0
         
         while self.global_step < self.config.training.max_steps:
             # Get next batch
             try:
                 batch = next(train_iter)
             except StopIteration:
+                # Set epoch for distributed sampler (required for proper shuffling)
+                epoch += 1
+                if self.train_sampler is not None:
+                    self.train_sampler.set_epoch(epoch)
                 train_iter = iter(self.train_loader)
                 batch = next(train_iter)
             
@@ -516,16 +596,12 @@ class DJTransitionTrainer:
                 # Tensorboard logging
                 if self.use_tensorboard:
                     self.writer.add_scalar('train/loss', avg_loss, self.global_step)
-                    self.writer.add_scalar('train/audio_loss', losses['audio_loss'], self.global_step)
-                    self.writer.add_scalar('train/smoothness', losses['smoothness'], self.global_step)
                     self.writer.add_scalar('train/lr', lr, self.global_step)
                 
                 # Wandb logging
                 if self.use_wandb:
                     wandb.log({
                         'train/loss': avg_loss,
-                        'train/audio_loss': losses['audio_loss'],
-                        'train/smoothness': losses['smoothness'],
                         'train/lr': lr,
                         'step': self.global_step,
                     })
@@ -568,6 +644,7 @@ def run_training(
     resume_from: Optional[str] = None,
     use_wandb: bool = False,
     synthetic_data: bool = False,
+    gcs_bucket: Optional[str] = None,
 ):
     """
     Run training from Python (called by CLI).
@@ -581,6 +658,7 @@ def run_training(
         resume_from: Path to checkpoint to resume from
         use_wandb: Enable wandb logging
         synthetic_data: Use synthetic transition dataset
+        gcs_bucket: GCS bucket to download data from if not local
     """
     # Load config
     config = get_config()
@@ -609,13 +687,41 @@ def run_training(
         use_wandb=use_wandb,
         use_tensorboard=True,
         synthetic_data=synthetic_data,
+        gcs_bucket=gcs_bucket,
     )
     
     # Train
     trainer.train()
 
 
+def setup_distributed():
+    """Initialize distributed training if launched with torchrun."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        torch.distributed.init_process_group(
+            backend="nccl",  # Use gloo for CPU
+            rank=rank,
+            world_size=world_size,
+        )
+        
+        logger.info(f"Initialized DDP: rank {rank}/{world_size}, local_rank {local_rank}")
+        return True
+    return False
+
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
 def main():
+    # Initialize DDP if launched with torchrun
+    is_distributed = setup_distributed()
+    
     parser = argparse.ArgumentParser(
         description="Train DJTransGAN v2 model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -679,19 +785,30 @@ def main():
         choices=["cpu", "cuda", "mps"],
         help="Override device selection",
     )
+    parser.add_argument(
+        "--gcs-bucket",
+        type=str,
+        default=None,
+        help="GCS bucket to download data from if not local",
+    )
     
     args = parser.parse_args()
     
-    run_training(
-        data_dir=args.data,
-        output_dir=args.output,
-        max_steps=args.steps,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        resume_from=args.resume,
-        use_wandb=args.wandb,
-        synthetic_data=args.synthetic,
-    )
+    try:
+        run_training(
+            data_dir=args.data,
+            output_dir=args.output,
+            max_steps=args.steps,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            resume_from=args.resume,
+            use_wandb=args.wandb,
+            synthetic_data=args.synthetic,
+            gcs_bucket=args.gcs_bucket,
+        )
+    finally:
+        # Clean up DDP
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
