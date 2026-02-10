@@ -46,6 +46,49 @@ except ImportError:
     librosa = None
     print("WARNING: librosa not available, some analysis features will be limited")
 
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
+
+
+def load_audio_file(path: Path, target_sr: int = 44100) -> tuple:
+    """
+    Load audio file with fallback to librosa for mp3 files.
+    
+    Returns:
+        (waveform, sample_rate) - waveform is [channels, samples] tensor
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    
+    # Try torchaudio first for wav files (most reliable)
+    if suffix == '.wav':
+        try:
+            waveform, sr = torchaudio.load(str(path))
+            if sr != target_sr:
+                waveform = torchaudio.functional.resample(waveform, sr, target_sr)
+            return waveform, target_sr
+        except Exception:
+            pass
+    
+    # Use librosa for mp3 and as fallback
+    if librosa is not None:
+        try:
+            y, sr = librosa.load(str(path), sr=target_sr, mono=False)
+            if y.ndim == 1:
+                y = y[np.newaxis, :]  # Add channel dimension
+            waveform = torch.from_numpy(y).float()
+            return waveform, target_sr
+        except Exception:
+            pass
+    
+    # Last resort - try torchaudio anyway
+    waveform, sr = torchaudio.load(str(path))
+    if sr != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
+    return waveform, target_sr
+
 
 # Configuration
 DEFAULT_OUTPUT_DIR = Path("./processed")
@@ -477,15 +520,9 @@ def process_track_library(
     
     for track_a, track_b, pair_id in tqdm(pairs, desc="Processing pairs"):
         try:
-            # Load audio
-            waveform_a, sr_a = torchaudio.load(str(track_a))
-            waveform_b, sr_b = torchaudio.load(str(track_b))
-            
-            # Resample if needed
-            if sr_a != DEFAULT_SAMPLE_RATE:
-                waveform_a = torchaudio.functional.resample(waveform_a, sr_a, DEFAULT_SAMPLE_RATE)
-            if sr_b != DEFAULT_SAMPLE_RATE:
-                waveform_b = torchaudio.functional.resample(waveform_b, sr_b, DEFAULT_SAMPLE_RATE)
+            # Load audio (with mp3 support via librosa)
+            waveform_a, _ = load_audio_file(track_a, DEFAULT_SAMPLE_RATE)
+            waveform_b, _ = load_audio_file(track_b, DEFAULT_SAMPLE_RATE)
             
             trans_samples = int(TRANSITION_DURATION * DEFAULT_SAMPLE_RATE)
             
