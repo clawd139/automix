@@ -55,7 +55,12 @@ def main():
               help="Demucs model (htdemucs, htdemucs_ft, mdx_extra)")
 @click.option("--device", type=click.Choice(["auto", "cpu", "cuda", "mps"]), default="auto",
               help="Device for processing")
-def prepare(tracks: str, output: str, max_pairs: Optional[int], demucs_model: str, device: str):
+@click.option("--gpus", type=int, default=0,
+              help="Number of GPUs for parallel demucs (0=auto-detect)")
+@click.option("--workers", type=int, default=1,
+              help="CPU workers per GPU for audio loading/analysis")
+def prepare(tracks: str, output: str, max_pairs: Optional[int], demucs_model: str, device: str,
+            gpus: int, workers: int):
     """Prepare training data from a track library.
     
     Separates stems using demucs and creates synthetic transition pairs.
@@ -75,6 +80,10 @@ def prepare(tracks: str, output: str, max_pairs: Optional[int], demucs_model: st
         device = get_device()
     click.echo(f"🖥️  Device: {device}")
     
+    n_gpus = gpus if gpus > 0 else get_gpu_count()
+    if n_gpus > 1:
+        click.echo(f"🚀 Parallel: {n_gpus} GPUs × {workers} workers = {n_gpus * workers} total workers")
+    
     # Run pipeline
     process_track_library(
         tracks_dir=tracks_path,
@@ -82,6 +91,8 @@ def prepare(tracks: str, output: str, max_pairs: Optional[int], demucs_model: st
         demucs_model=demucs_model,
         device=device,
         max_pairs=max_pairs,
+        n_gpus=n_gpus,
+        n_workers=workers,
     )
     
     click.echo("✅ Data preparation complete!")

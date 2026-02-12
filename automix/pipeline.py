@@ -502,6 +502,58 @@ def process_extracted_transitions(
     log(f"Processing complete: {success_count}/{len(transitions)} successful", log_file)
 
 
+def _worker_process_pair(args):
+    """Worker function for parallel pair processing."""
+    track_a, track_b, pair_id, output_dir, demucs_model, device, temp_dir = args
+    
+    try:
+        waveform_a, _ = load_audio_file(track_a, DEFAULT_SAMPLE_RATE)
+        waveform_b, _ = load_audio_file(track_b, DEFAULT_SAMPLE_RATE)
+        
+        trans_samples = int(TRANSITION_DURATION * DEFAULT_SAMPLE_RATE)
+        
+        len_a = waveform_a.shape[1]
+        len_b = waveform_b.shape[1]
+        
+        if len_a < trans_samples or len_b < trans_samples:
+            return False
+        
+        seg_a = waveform_a[:, -trans_samples:]
+        seg_b = waveform_b[:, :trans_samples]
+        
+        t = torch.linspace(0, 1, trans_samples)
+        fade_out = torch.cos(t * np.pi / 2).unsqueeze(0)
+        fade_in = torch.sin(t * np.pi / 2).unsqueeze(0)
+        transition = seg_a * fade_out + seg_b * fade_in
+        
+        temp_a = Path(temp_dir) / f"{pair_id}_a.wav"
+        temp_b = Path(temp_dir) / f"{pair_id}_b.wav"
+        temp_trans = Path(temp_dir) / f"{pair_id}_trans.wav"
+        
+        save_audio_file(temp_a, seg_a, DEFAULT_SAMPLE_RATE)
+        save_audio_file(temp_b, seg_b, DEFAULT_SAMPLE_RATE)
+        save_audio_file(temp_trans, transition, DEFAULT_SAMPLE_RATE)
+        
+        success = process_transition_pair(
+            pair_id=pair_id,
+            track_a_audio=temp_a,
+            track_b_audio=temp_b,
+            transition_audio=temp_trans,
+            output_dir=Path(output_dir),
+            demucs_model=demucs_model,
+            device=device,
+        )
+        
+        temp_a.unlink(missing_ok=True)
+        temp_b.unlink(missing_ok=True)
+        temp_trans.unlink(missing_ok=True)
+        
+        return success
+    except Exception as e:
+        print(f"Error with {pair_id}: {e}")
+        return False
+
+
 def process_track_library(
     tracks_dir: Path,
     output_dir: Path,
@@ -509,14 +561,20 @@ def process_track_library(
     device: str = "auto",
     max_pairs: Optional[int] = None,
     log_file: Optional[Path] = None,
+    n_gpus: int = 1,
+    n_workers: int = 1,
 ):
     """
     Create synthetic transition pairs from a track library.
     
     For each pair of tracks, creates a synthetic crossfade transition
     and processes with stem separation.
+    
+    Multi-GPU: pairs are sharded across GPUs, each GPU runs demucs in parallel.
+    n_workers controls CPU parallelism for audio loading/analysis per GPU.
     """
     import random
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -531,6 +589,17 @@ def process_track_library(
         log("Need at least 2 tracks", log_file)
         return
     
+    # Auto-detect GPUs if not specified
+    if device == "auto" or device == "cuda":
+        if torch.cuda.is_available():
+            detected_gpus = torch.cuda.device_count()
+            if n_gpus <= 1:
+                n_gpus = detected_gpus
+            else:
+                n_gpus = min(n_gpus, detected_gpus)
+        else:
+            n_gpus = 1
+    
     # Generate random pairs
     n_pairs = max_pairs or len(audio_files)
     pairs = []
@@ -541,74 +610,56 @@ def process_track_library(
         if not (output_dir / pair_id / "analysis.json").exists():
             pairs.append((a, b, pair_id))
     
-    log(f"Processing {len(pairs)} new pairs", log_file)
+    log(f"Processing {len(pairs)} new pairs with {n_gpus} GPU(s) and {n_workers} CPU worker(s) per GPU", log_file)
     
-    temp_dir = output_dir / "_temp"
-    temp_dir.mkdir(exist_ok=True)
-    
-    success_count = 0
-    
-    for track_a, track_b, pair_id in tqdm(pairs, desc="Processing pairs"):
-        try:
-            # Load audio (with mp3 support via librosa)
-            waveform_a, _ = load_audio_file(track_a, DEFAULT_SAMPLE_RATE)
-            waveform_b, _ = load_audio_file(track_b, DEFAULT_SAMPLE_RATE)
-            
-            trans_samples = int(TRANSITION_DURATION * DEFAULT_SAMPLE_RATE)
-            
-            # Extract segments
-            len_a = waveform_a.shape[1]
-            len_b = waveform_b.shape[1]
-            
-            if len_a < trans_samples or len_b < trans_samples:
-                log(f"Tracks too short for {pair_id}", log_file)
-                continue
-            
-            # Take end of A, start of B
-            seg_a = waveform_a[:, -trans_samples:]
-            seg_b = waveform_b[:, :trans_samples]
-            
-            # Create crossfade transition
-            t = torch.linspace(0, 1, trans_samples)
-            fade_out = torch.cos(t * np.pi / 2).unsqueeze(0)
-            fade_in = torch.sin(t * np.pi / 2).unsqueeze(0)
-            
-            transition = seg_a * fade_out + seg_b * fade_in
-            
-            # Save temp audio files
-            temp_a = temp_dir / f"{pair_id}_a.wav"
-            temp_b = temp_dir / f"{pair_id}_b.wav"
-            temp_trans = temp_dir / f"{pair_id}_trans.wav"
-            
-            save_audio_file(temp_a, seg_a, DEFAULT_SAMPLE_RATE)
-            save_audio_file(temp_b, seg_b, DEFAULT_SAMPLE_RATE)
-            save_audio_file(temp_trans, transition, DEFAULT_SAMPLE_RATE)
-            
-            # Process the pair
-            success = process_transition_pair(
-                pair_id=pair_id,
-                track_a_audio=temp_a,
-                track_b_audio=temp_b,
-                transition_audio=temp_trans,
-                output_dir=output_dir,
-                demucs_model=demucs_model,
-                device=device,
-                log_file=log_file,
+    if n_gpus <= 1 and n_workers <= 1:
+        # Single GPU, single worker — original sequential path
+        temp_dir = output_dir / "_temp"
+        temp_dir.mkdir(exist_ok=True)
+        
+        success_count = 0
+        gpu_device = "cuda:0" if torch.cuda.is_available() else device
+        
+        for track_a, track_b, pair_id in tqdm(pairs, desc="Processing pairs"):
+            result = _worker_process_pair(
+                (track_a, track_b, pair_id, str(output_dir), demucs_model, gpu_device, str(temp_dir))
             )
-            
-            if success:
+            if result:
                 success_count += 1
+        
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        # Multi-GPU parallel processing
+        # Shard pairs across GPUs, use ProcessPoolExecutor for parallelism
+        total_workers = n_gpus * n_workers
+        
+        # Build work items with GPU assignment
+        work_items = []
+        for i, (track_a, track_b, pair_id) in enumerate(pairs):
+            gpu_id = i % n_gpus
+            gpu_device = f"cuda:{gpu_id}" if torch.cuda.is_available() else device
+            temp_dir = output_dir / f"_temp_gpu{gpu_id}"
+            temp_dir.mkdir(exist_ok=True)
+            work_items.append(
+                (track_a, track_b, pair_id, str(output_dir), demucs_model, gpu_device, str(temp_dir))
+            )
+        
+        success_count = 0
+        with ProcessPoolExecutor(max_workers=total_workers) as executor:
+            futures = {executor.submit(_worker_process_pair, item): item for item in work_items}
             
-            # Clean up temp files
-            temp_a.unlink(missing_ok=True)
-            temp_b.unlink(missing_ok=True)
-            temp_trans.unlink(missing_ok=True)
-            
-        except Exception as e:
-            log(f"Error with {pair_id}: {e}", log_file)
-    
-    # Clean up temp directory
-    shutil.rmtree(temp_dir, ignore_errors=True)
+            with tqdm(total=len(futures), desc=f"Processing pairs ({n_gpus} GPUs)") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        if future.result():
+                            success_count += 1
+                    except Exception as e:
+                        log(f"Worker error: {e}", log_file)
+                    pbar.update(1)
+        
+        # Clean up temp dirs
+        for gpu_id in range(n_gpus):
+            shutil.rmtree(output_dir / f"_temp_gpu{gpu_id}", ignore_errors=True)
     
     log("=" * 60, log_file)
     log(f"Processing complete: {success_count}/{len(pairs)} successful", log_file)
