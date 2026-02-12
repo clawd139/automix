@@ -524,7 +524,7 @@ def process_track_library(
     log("Processing track library for synthetic transitions", log_file)
     
     # Find all audio files
-    audio_files = list(tracks_dir.glob("*.mp3")) + list(tracks_dir.glob("*.wav"))
+    audio_files = list(tracks_dir.rglob("*.mp3")) + list(tracks_dir.rglob("*.wav")) + list(tracks_dir.rglob("*.flac"))
     log(f"Found {len(audio_files)} tracks", log_file)
     
     if len(audio_files) < 2:
